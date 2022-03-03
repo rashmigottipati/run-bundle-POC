@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,11 +18,13 @@ const (
 	channelEntryName = "api-operator.v1.0.1"
 )
 
-// Bundle represents a bundle with all of the properties and metadata
-type Bundle struct {
+// FBCContext represents an FBC context that has bundle, package and channel
+// properties and metadata for creating an FBC.
+type FBCContext struct {
 	BundleImage       string
 	Package           string
 	DefaultChannel    string
+	FBCName           string
 	FBCPath           string
 	FBCDirContext     string
 	ChannelSchema     string
@@ -31,7 +33,8 @@ type Bundle struct {
 	DescriptionReader io.Reader
 }
 
-func (b *Bundle) createMinimalFBC() (*declarativeconfig.DeclarativeConfig, error) {
+//createMinimalFBC generates an FBC by creating bundle, package and channel blobs.
+func (f *FBCContext) createMinimalFBC() (*declarativeconfig.DeclarativeConfig, error) {
 	var (
 		declcfg        *declarativeconfig.DeclarativeConfig
 		declcfgpackage *declarativeconfig.Package
@@ -39,89 +42,56 @@ func (b *Bundle) createMinimalFBC() (*declarativeconfig.DeclarativeConfig, error
 	)
 
 	render := action.Render{
-		Refs: []string{b.BundleImage},
+		Refs: []string{f.BundleImage},
 	}
 
-	// generate bundle blob
+	// generate bundles by rendering the bundle objects.
 	declcfg, err = render.Run(context.TODO())
 	if err != nil {
 		log.Errorf("error in rendering the bundle image: %v", err)
 		return nil, err
 	}
 
-	var buf bytes.Buffer
-	err = declarativeconfig.WriteJSON(*declcfg, &buf)
-	if err != nil {
-		log.Errorf("error writing to JSON encoder: %v", err)
+	if len(declcfg.Bundles) < 0 {
+		log.Errorf("error in rendering the correct number of bundles: %v", err)
 		return nil, err
 	}
-
-	// declcfg.Bundles[0] = []declarativeconfig.Bundle{*declcfgpackage}
-
-	// write bundle blob to FBC
-	if err := os.WriteFile("testFBC", buf.Bytes(), 0644); err != nil {
-		log.Errorf("failed to write bundle blob to file: %v", err)
-		return nil, err
+	// validate length of bundles and add them to declcfg.Bundles.
+	if len(declcfg.Bundles) == 1 {
+		declcfg.Bundles = []declarativeconfig.Bundle{*&declcfg.Bundles[0]}
+	} else {
+		return nil, errors.New("error in expected length of bundles")
 	}
 
-	// generate package blob
+	// init packages
 	init := action.Init{
-		Package:           b.Package,
-		DefaultChannel:    b.DefaultChannel,
-		DescriptionReader: b.DescriptionReader,
+		Package:           f.Package,
+		DefaultChannel:    f.DefaultChannel,
+		DescriptionReader: f.DescriptionReader,
 	}
 
+	// generate packages
 	declcfgpackage, err = init.Run()
-	packageblob, err := json.Marshal(declcfgpackage)
 	if err != nil {
-		log.Errorf("error marshaling package blob: %v", err)
+		log.Errorf("error in generating packages for the FBC: %v", err)
 		return nil, err
 	}
-
 	declcfg.Packages = []declarativeconfig.Package{*declcfgpackage}
 
-	// fbcPath := filepath.Join(b.FBCDirContext, "testFBC")
-	file, err := os.OpenFile("testFBC", os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Errorf("error opening FBC file: %v", err)
-		return nil, err
-	}
-	defer file.Close()
-	if _, err := file.WriteString(string(packageblob) + "\n"); err != nil {
-		log.Errorf("error writing to FBC file: %s", err)
-		return nil, err
-	}
-
-	// generate channel blob
+	// generate channels
 	channel := declarativeconfig.Channel{
-		Schema:  b.ChannelSchema,
-		Name:    b.ChannelName,
-		Package: b.Package,
-		Entries: b.ChannelEntries,
-	}
-
-	channelblob, err := json.Marshal(channel)
-	if err != nil {
-		log.Errorf("error marshaling to JSON: %s", err)
-		return nil, err
+		Schema:  f.ChannelSchema,
+		Name:    f.ChannelName,
+		Package: f.Package,
+		Entries: f.ChannelEntries,
 	}
 
 	declcfg.Channels = []declarativeconfig.Channel{channel}
 
-	file, err = os.OpenFile("testFBC", os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Errorf("error opening file: %v", err)
-		return nil, err
-	}
-
-	if _, err := file.WriteString(string(channelblob) + "\n"); err != nil {
-		log.Errorf("error writing to FBC file: %v", err)
-		return nil, err
-	}
-
 	return declcfg, nil
 }
 
+// validateFBC converts the generated declarative config to a model and validates it.
 func validateFBC(declcfg *declarativeconfig.DeclarativeConfig) error {
 	// convert declarative config to model
 	FBCmodel, err := declarativeconfig.ConvertToModel(*declcfg)
@@ -138,18 +108,48 @@ func validateFBC(declcfg *declarativeconfig.DeclarativeConfig) error {
 	return nil
 }
 
+// writeDecConfigToFile writes the generated declarative config to a file.
+func (f *FBCContext) writeDecConfigToFile(declcfg *declarativeconfig.DeclarativeConfig) error {
+	var buf bytes.Buffer
+	err := declarativeconfig.WriteJSON(*declcfg, &buf)
+	if err != nil {
+		log.Errorf("error writing to JSON encoder: %v", err)
+		return err
+	}
+	if err := os.MkdirAll(f.FBCDirContext, 0755); err != nil {
+		log.Errorf("error creating a directory for FBC: %v", err)
+		return err
+	}
+	fbcFilePath := filepath.Join(f.FBCPath, f.FBCName)
+	file, err := os.OpenFile(fbcFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Errorf("error opening FBC file: %v", err)
+		return err
+	}
+
+	defer file.Close()
+
+	if _, err := file.WriteString(string(buf.Bytes()) + "\n"); err != nil {
+		log.Errorf("error writing to FBC file: %v", err)
+		return err
+	}
+
+	return nil
+}
+
 func main() {
 	wd, err := os.Getwd()
 	if err != nil {
 		log.Error(err)
 	}
 
-	// Create the bundle context.
-	b := &Bundle{
+	// Create the FBC context.
+	f := &FBCContext{
 		BundleImage:       "quay.io/rashmigottipati/api-operator:1.0.1",
 		Package:           "api-operator",
-		FBCPath:           filepath.Join(wd, "testdata"),
 		FBCDirContext:     "testdata",
+		FBCPath:           filepath.Join(wd, "testdata"),
+		FBCName:           "testFBC",
 		DescriptionReader: bytes.NewBufferString("foo"),
 		DefaultChannel:    "foo",
 		ChannelSchema:     "olm.channel",
@@ -162,15 +162,24 @@ func main() {
 			Name: channelEntryName,
 		},
 	}
-	b.ChannelEntries = entries
+	f.ChannelEntries = entries
 
-	// generate a minimal FBC
-	declcfg, err := b.createMinimalFBC()
+	// generate an FBC
+	declcfg, err := f.createMinimalFBC()
 	if err != nil {
 		log.Errorf("error creating a minimal FBC: %v", err)
 		return
 	}
 
+	// write declarative config to file
+	if err = f.writeDecConfigToFile(declcfg); err != nil {
+		log.Errorf("error writing declarative config to file: %v", err)
+		return
+	}
+
 	// validate the generated declarative config
-	err = validateFBC(declcfg)
+	if err = validateFBC(declcfg); err != nil {
+		log.Errorf("error validating the generated FBC: %v", err)
+		return
+	}
 }
